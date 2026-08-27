@@ -1,0 +1,14 @@
+# Native x86_64 twin of ghcr.io/tinygrad/cuda-arm64:v2.3 (Debian 13 + python3.13 + libnvrtc + libnvJitLink), used by tinygrad's
+# macOS NVRTC compile server (tinygrad/runtime/support/compiler_cuda.py: osx_docker_cmd). The upstream image is arm64-only;
+# on an Intel Mac it only runs under Colima's qemu-aarch64 binfmt (works, but slow). Build with:
+#   docker build --platform=linux/amd64 -t cuda-amd64:v2.3 extra/cuda_docker_amd64
+# and select it with CUDA_DOCKER_IMAGE=cuda-amd64:v2.3 (local patch, see RUNBOOK.md).
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates python3 && \
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+  dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+  apt-get update && apt-get install -y --no-install-recommends cuda-nvrtc-12-8 libnvjitlink-12-8 cuda-cudart-dev-12-8 && rm -rf /var/lib/apt/lists/* && \
+  ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
+# cuda-cudart-dev provides the CUDA headers (cuda_fp16.h, cuda_bf16.h, ...) that fp16/bf16 kernels include; tinygrad passes -I/usr/local/cuda/include
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib
+ENTRYPOINT ["python3"]
