@@ -21,7 +21,8 @@ Ada cards should behave the same, Blackwell is untested. Everything here is MIT 
 * Intel Mac, macOS 15, an Ampere or newer NVIDIA card in a PCIe slot (or Thunderbolt), Xcode with the DriverKit SDK.
 * **SIP disabled** and `systemextensionsctl developer on`. The dext here is ad-hoc signed (the upstream signing identity is not
   available), and macOS only loads such a driver with SIP off. This lowers system security, decide for yourself.
-* Docker via colima (the NVRTC compile server runs in a container), python 3.12 venv with tinygrad installed editable.
+* Docker via colima (the NVRTC compile server runs in a container), python 3.12 venv with tinygrad installed editable. The
+  checkout and `TMPDIR` must live under `$HOME`: colima only shares your home directory with containers.
 
 ## Install
 
