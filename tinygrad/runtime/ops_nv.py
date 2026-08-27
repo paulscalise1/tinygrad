@@ -754,6 +754,16 @@ class NVDevice(HCQCompiled[NVSignal]):
       for i, e in enumerate(sm_errors.smErrorStateArray):
         if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
 
+    # Raw MMU fault snapshot registers (Turing+, BAR0 0xb83080.., per nouveau nvkm/subdev/fault/tu102.c) as a fallback when RM reports
+    # nothing valid. GSP-RM may have cleared them already, but they are free to read.
+    try:
+      rd = self.iface.dev_impl.rreg
+      addrlo, addrhi, info0, insthi, info1, status = (rd(0xb83080 + i * 4) for i in range(6))
+      report += [f"mmu snapshot: valid={(info1 >> 31) & 1} addr={(addrhi << 32) | addrlo:#x} inst={(insthi << 32) | (info0 & 0xfffff000):#x} "
+                 f"engine={info0 & 0xff} reason={info1 & 0x1f} client={(info1 >> 8) & 0x7f} access={(info1 >> 16) & 0xf} hub={(info1 >> 20) & 1} "
+                 f"gpc={(info1 >> 24) & 0x1f} status={status:#x}"]
+      report += [f"sm_errors.mmuFault.valid={sm_errors.mmuFault.valid}"]
+    except Exception as e: report += [f"mmu snapshot unavailable: {e}"]
     raise RuntimeError("\n".join(report))
 
   def _prof_init(self):

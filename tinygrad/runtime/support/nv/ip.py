@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, time, array, struct, itertools, dataclasses
 from typing import cast, Any
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
-from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv
+from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv, getenv
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.elf import elf_loader
@@ -19,7 +19,12 @@ class NV_IP:
 class NVRpcQueue:
   def __init__(self, gsp:NV_GSP, view:MMIOInterface, completion_q_view:MMIOInterface|None=None):
     self.tx_view = view.view(fmt='I')
-    wait_cond(lambda: self.tx_view[getattr(nv.msgqTxHeader, 'entryOff').offset // 4], value=0x1000, msg="RPC queue not initialized")
+    try:
+      wait_cond(lambda: self.tx_view[getattr(nv.msgqTxHeader, 'entryOff').offset // 4], value=0x1000, msg="RPC queue not initialized",
+                timeout_ms=getenv("NV_RPC_TIMEOUT_MS", 10000))
+    except TimeoutError:
+      gsp.dump_boot_state(view)
+      raise
     self.tx = nv.msgqTxHeader.from_buffer_copy(bytes(view[:ctypes.sizeof(nv.msgqTxHeader)]))
 
     if completion_q_view is not None:
@@ -71,6 +76,8 @@ class NVRpcQueue:
       elif hdr.function == nv.NV_VGPU_MSG_EVENT_OS_ERROR_LOG:
         print(f"nv {self.gsp.nvdev.devfmt}: GSP LOG: {msg[12:].rstrip(bytes([0])).decode('utf-8')}")
 
+      if hdr.function == nv.NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED and DEBUG >= 1:
+        print(f"nv {self.gsp.nvdev.devfmt}: GSP event MMU_FAULT_QUEUED (len {hdr.length}): {msg.hex()}", flush=True)
       self.gsp.nvdev.is_err_state |= hdr.function in {nv.NV_VGPU_MSG_EVENT_OS_ERROR_LOG, nv.NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED}
 
       # Update the read pointer
@@ -366,6 +373,7 @@ class NV_GSP(NV_IP):
     pte_cnt = ((queue_pte_cnt:=(queue_size * 2) // 0x1000)) + round_up(queue_pte_cnt * 8, 0x1000) // 0x1000
     pt_size = round_up(pte_cnt * 8, 0x1000)
     queues_view, _, queues_sysmem = self.nvdev._alloc_boot_mem(pt_size + queue_size * 2, sysmem=True)
+    self.queues_sysmem = queues_sysmem
 
     # Fill up ptes
     for i, sysmem in enumerate(queues_sysmem): queues_view.view(i * 0x8, 0x8, fmt='Q')[0] = sysmem
@@ -387,16 +395,185 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_view, None)
 
   def init_libos_args(self):
-    _, _, logbuf_addrs = self.nvdev._alloc_boot_mem(2 << 20)
+    # NV_GSP_LOGS_FB=1: place the libos log regions in VRAM (LIBOS_MEMORY_REGION_LOC_FB) instead of sysmem, so the GSP's own boot
+    # log is readable over BAR1 even on hosts where its sysmem writes never arrive. Diagnostic only.
+    self.logbuf_names = ["INIT", "INTR", "RM", "MNOC", "KRNL"]
+    self.logs_in_fb = bool(getenv("NV_GSP_LOGS_FB", 0))
+    if self.logs_in_fb:
+      self.logbuf_view, logbuf_paddr, _ = self.nvdev._alloc_boot_mem(2 << 20, sysmem=False)
+      self.logbuf_view[:2 << 20] = bytes(2 << 20)
+      logbuf_loc, logbuf_base = nv.LIBOS_MEMORY_REGION_LOC_FB, logbuf_paddr
+      if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: libos log regions placed in FB at {logbuf_paddr:#x}", flush=True)
+    else:
+      self.logbuf_view, _, logbuf_addrs = self.nvdev._alloc_boot_mem(2 << 20)
+      logbuf_loc, logbuf_base = nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, logbuf_addrs[0]
     libos_args_view, _, libos_addrs = self.nvdev._alloc_boot_mem(0x1000)
     self.libos_args_sysmem = libos_addrs[0]
 
-    libos_structs = [nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x10000,
-        id8=int.from_bytes(bytes(f"LOG{name}", 'utf-8'), 'big'), pa=logbuf_addrs[0] + 0x10000 * i)
-        for i, name in enumerate(["INIT", "INTR", "RM", "MNOC", "KRNL"])]
+    libos_structs = [nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=logbuf_loc, size=0x10000,
+        id8=int.from_bytes(bytes(f"LOG{name}", 'utf-8'), 'big'), pa=logbuf_base + 0x10000 * i)
+        for i, name in enumerate(self.logbuf_names)]
     libos_structs.append(nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x1000,
         id8=int.from_bytes(bytes("RMARGS", 'utf-8'), 'big'), pa=self.rm_args_sysmem))
     libos_args_view[:sum(ctypes.sizeof(s) for s in libos_structs)] = b''.join(bytes(s) for s in libos_structs)
+
+  def dump_boot_state(self, queue_view:MMIOInterface):
+    # Called when GSP-RM never brought up its RPC queue. Tells whether the GSP wrote *anything* to sysmem (libos log regions)
+    # vs. booted but never got as far as the queues. Raw dump goes next to the other logs so it can be decoded offline.
+    import os, time as _time
+    logdir = os.path.expanduser(os.getenv("NV_DUMP_DIR", "~/tinygpu-logs")); os.makedirs(logdir, exist_ok=True)
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    print(f"nv {self.nvdev.devfmt}: RPC queue never initialized. GSP boot state dump:", flush=True)
+    import struct as _struct
+    for i, name in enumerate(self.logbuf_names):
+      region = bytes(self.logbuf_view[i * 0x10000:(i + 1) * 0x10000])
+      nz = sum(1 for b in region if b)
+      print(f"  LOG{name:<5} nonzero bytes: {nz:6d}/65536  head: {region[:32].hex()}", flush=True)
+      # libos log layout (open-gpu-kernel-modules liblogdecode.c): u64 put (in 8-byte entries) followed by records written backwards from
+      # put as {args..., metadata ptr, timestamp}. The metadata/format strings are stripped from public firmware, so print the raw words.
+      put = _struct.unpack_from('<Q', region, 0)[0]
+      if 0 < put < 0x2000:
+        words = _struct.unpack_from(f'<{min(put, 24)}Q', region, 8 + max(0, put - 24) * 8)
+        print(f"    put={put} entries, last words before put: " + " ".join(f"{w:#x}" for w in words), flush=True)
+    qhdr = bytes(queue_view[:0x40])
+    print(f"  stat queue hdr: {qhdr.hex()}", flush=True)
+    flcn = self.nvdev.flcn
+    probes = {"GSP RISCV_CPUCTL": lambda: self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(flcn.falcon).read(),
+              "GSP MAILBOX0": lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(flcn.falcon).read(),
+              "GSP MAILBOX1": lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX1.with_base(flcn.falcon).read(),
+              "SEC2 MAILBOX0": lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(flcn.sec2).read(),
+              "WPR2_ADDR_HI": lambda: self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read(),
+              "BSI_SECURE_SCRATCH_14": lambda: self.nvdev.NV_PGC6_BSI_SECURE_SCRATCH_14.read()}
+    for name, fn in probes.items():
+      try: print(f"  {name}: {fn():#010x}", flush=True)
+      except Exception as e: print(f"  {name}: <{e}>", flush=True)
+    # raw falcon/RISC-V registers (GA10x offsets, open-gpu-kernel-modules dev_falcon_v4.h / dev_riscv_pri.h / Tegra GA10B headers):
+    # IRQSTAT bit6 SWGEN0 = GSP raised "message available" (it wrote to the status queue), bit4 HALT = CrashCat halt, bit5 EXTERR
+    raw = {"IRQSTAT": 0x110008, "FALCON_OS": 0x110080, "FALCON_CPUCTL": 0x110100, "EXTERRADDR": 0x110168, "EXTERRSTAT": 0x11016c,
+           "QUEUE_HEAD0": 0x110c00, "FBIF_TRANSCFG0": 0x110600, "RISCV_BCR_CTRL": 0x111668, "RISCV_BCR_DMACFG": 0x11166c,
+           "RISCV_BR_RETCODE": 0x11165c, "RISCV_IRQMASK": 0x111528, "RISCV_IRQDEST": 0x11152c, "SEC2_IRQSTAT": 0x840008, "SEC2_CPUCTL": 0x840100}
+    vals = {k: self.nvdev.rreg(a) for k, a in raw.items()}
+    print("  raw regs: " + " ".join(f"{k}={v:#x}" for k, v in vals.items()), flush=True)
+    irq = vals["IRQSTAT"]
+    print(f"  IRQSTAT decode: SWGEN0(msg posted)={(irq >> 6) & 1} HALT={(irq >> 4) & 1} EXTERR={(irq >> 5) & 1}; "
+          f"BR_RETCODE result={vals['RISCV_BR_RETCODE'] & 3} (3=pass 2=fail)", flush=True)
+    try:
+      pci = self.nvdev.pci_dev
+      st, devsta = pci.read_config(0x06, 2), None
+      print(f"  PCI_STATUS={st:#06x} (master_abort={(st >> 13) & 1} target_abort={(st >> 12) & 1} sig_sys_err={(st >> 14) & 1} parity={(st >> 15) & 1})", flush=True)
+    except Exception as e: print(f"  PCI_STATUS: <{e}>", flush=True)
+    with open(f"{logdir}/gsp-logbuf-{stamp}.bin", "wb") as f: f.write(bytes(self.logbuf_view[:]))
+    with open(f"{logdir}/gsp-statq-{stamp}.bin", "wb") as f: f.write(bytes(queue_view[:0x1000]))
+    print(f"  raw dumps: {logdir}/gsp-logbuf-{stamp}.bin, {logdir}/gsp-statq-{stamp}.bin", flush=True)
+    print(f"  vram_size={self.nvdev.vram_size:#x} large_bar={self.nvdev.large_bar} bars(as reported by dext)="
+          f"{[hex(self.nvdev.pci_dev.bar_info(b)[0]) for b in (0,1,3)]}", flush=True)
+    print(f"  sysmem: libos_args={self.libos_args_sysmem:#x} rm_args={self.rm_args_sysmem:#x} wpr_meta={self.wpr_meta_sysmem:#x} "
+          f"radix3={self.gsp_radix3_addrs[0]:#x} bootloader={self.booter_bar1:#x} queues={self.queues_sysmem[0]:#x}", flush=True)
+    # The Booter (SEC2) writes GSP_FW_WPR_META_VERIFIED (0xa0a0a0a0a0a0a0a0) into the WPR meta *in sysmem* once it has validated it
+    # (open-gpu-kernel-modules gsp_fw_wpr_meta.h). Seeing it here proves a GPU->host write landed and is visible to the CPU.
+    try:
+      mb = bytes(self.wpr_meta[:ctypes.sizeof(nv.GspFwWprMeta)])
+      m = nv.GspFwWprMeta.from_buffer_copy(mb)
+      print(f"  wpr_meta (host view): magic={m.magic:#x} revision={m.revision:#x} verified={m.verified:#x} "
+            f"({'SEC2 write to sysmem VISIBLE' if m.verified == 0xa0a0a0a0a0a0a0a0 else 'not verified / write NOT visible'}) bootCount={getattr(m, 'bootCount', -1)}", flush=True)
+    except Exception as e: print(f"  wpr_meta read failed: {e}", flush=True)
+    # Cache-coherency probe (x86 only): if the GSP's writes reached DRAM unsnooped, the CPU cache still holds the zeros we polled.
+    # clflush the lines and re-read; anything that shows up now was written by the GPU but invisible through the cache.
+    self.coherency_probe(queue_view)
+    self.crashcat_probe(logdir, stamp)
+
+  def crashcat_probe(self, logdir:str, stamp:str):
+    # NVIDIA's CrashCat protocol (open-gpu-kernel-modules: src/common/uproc/os/common/include/nv-crashcat.h, kernel_crashcat_engine*.c):
+    # a halted/crashed GSP leaves a "wayfinder" in NV_PFALCON_FALCON_DEBUGINFO pointing (via scratch registers) at a report queue in the
+    # falcon's DMEM/EMEM. All of it is readable over BAR0, so it works even when the GSP cannot write to system memory.
+    base, rd = self.nvdev.flcn.falcon, self.nvdev.rreg
+    regs = {"DEBUGINFO(WFL0)": base + 0x94, "MAILBOX0": base + 0x40, "MAILBOX1": base + 0x44}
+    regs |= {f"COMMON_SCRATCH_GROUP_{g}({i})": base + 0x300 + g * 0x10 + i * 4 for g in range(4) for i in range(4)}
+    regs |= {f"PGSP_MAILBOX({i})": 0x110804 + i * 4 for i in range(4)}
+    vals = {k: rd(a) for k, a in regs.items()}
+    print("  falcon scratch: " + " ".join(f"{k}={v:#x}" for k, v in vals.items() if v), flush=True)
+    if self.crashcat_view is not None:
+      cq = bytes(self.crashcat_view[:])
+      print(f"  crashcat sysmem queue ({self.crashcat_sysmem:#x}): {sum(1 for b in cq if b)} nonzero bytes", flush=True)
+      if any(cq):
+        with open(f"{logdir}/gsp-crashcat-sysmem-{stamp}.bin", "wb") as f: f.write(cq)
+        self.crashcat_decode(cq)
+    wfl0 = vals["DEBUGINFO(WFL0)"]
+    if (wfl0 & 0xffff) != 0xdead: print(f"  crashcat: no wayfinder in DEBUGINFO ({wfl0:#x}), GSP posted no crash report", flush=True); return
+    ver, loc = (wfl0 >> 16) & 0xf, (wfl0 >> 20) & 0x7
+    groups = {1: [0x40, 0x44], 2: [0x300, 0x304, 0x308, 0x30c], 3: [0x310, 0x314, 0x318, 0x31c], 4: [0x320, 0x324, 0x328, 0x32c],
+              5: [0x330, 0x334, 0x338, 0x33c]}
+    if ver != 1 or loc not in groups: print(f"  crashcat: unsupported wayfinder version {ver} / location {loc}", flush=True); return
+    sc = groups[loc]
+    wfl1 = (rd(base + sc[1]) << 32) | rd(base + sc[0])
+    aperture, unit, qsize_f, qoff = wfl1 & 7, (wfl1 >> 3) & 3, (wfl1 >> 6) & 0xf, (wfl1 >> 10) << 10
+    qsize = (qsize_f + 1) << {1: 10, 2: 12, 3: 16}.get(unit, 0)
+    put, get = (rd(base + sc[2]), rd(base + sc[3])) if len(sc) >= 4 else (None, None)
+    ap_name = {0: "SYSGPA", 1: "FBGPA", 2: "DMEM", 3: "EMEM"}.get(aperture, "?")
+    print(f"  crashcat: wayfinder v{ver} loc={loc} wfl1={wfl1:#x} queue aperture={ap_name} offset={qoff:#x} size={qsize:#x} put={put} get={get}", flush=True)
+    if aperture in (2, 3):
+      ctl, dat = (base + 0x1c0, base + 0x1c4) if aperture == 2 else (0x110ac0, 0x110ac4)
+      self.nvdev.wreg(ctl, (qoff & 0xffffff) | (1 << 25))  # AINCR
+      data = b''.join(rd(dat).to_bytes(4, 'little') for _ in range(qsize // 4))
+    elif aperture == 1: data = bytes(self.nvdev.vram.view(qoff, qsize)[:])
+    elif aperture == 0 and self.crashcat_view is not None and self.crashcat_sysmem <= qoff < self.crashcat_sysmem + len(self.crashcat_view):
+      data = bytes(self.crashcat_view[qoff - self.crashcat_sysmem:qoff - self.crashcat_sysmem + qsize])
+    else: print(f"  crashcat: SYSGPA queue at {qoff:#x} is not a buffer we own, cannot read it", flush=True); return
+    with open(f"{logdir}/gsp-crashcat-{stamp}.bin", "wb") as f: f.write(data)
+    print(f"  crashcat: raw queue dumped to {logdir}/gsp-crashcat-{stamp}.bin", flush=True)
+    self.crashcat_decode(data)
+
+  @staticmethod
+  def crashcat_decode(data:bytes):
+    import struct
+    off, n = 0, 0
+    while off + 8 <= len(data):
+      hdr = struct.unpack_from('<Q', data, off)[0]
+      if (hdr & 0xffff) != 0xdead: off += 8; continue
+      unit, psize, ptype = (hdr >> 20) & 3, (hdr >> 22) & 0x3ff, (hdr >> 32) & 0xff
+      plen = (psize + 1) << {0: 3, 1: 10, 2: 12, 3: 16}[unit]
+      payload = data[off + 8:off + 8 + plen]; n += 1
+      q = list(struct.unpack_from(f'<{len(payload) // 8}Q', payload)) if len(payload) >= 8 else []
+      if ptype == 0 and len(q) >= 7:
+        impl, reporter, rdata, source, cause, pc, sdata = q[:7]
+        modes = {0: "?", 1: "M", 2: "S", 3: "U"}; ctypes_ = {0: "EXCEPTION", 1: "TIMEOUT", 2: "PANIC", 3: "WATCHDOG"}
+        print(f"  crashcat REPORT: implementer={impl:#x} reporter(partition={reporter & 0xff}, ucode={(reporter >> 8) & 0xff}, "
+              f"mode={modes.get((reporter >> 16) & 7)}) version={rdata & 0xffffffff:#x} ts={rdata >> 32:#x}", flush=True)
+        print(f"    source(partition={source & 0xff}, ucode={(source >> 8) & 0xff}, mode={modes.get((source >> 16) & 7)}) "
+              f"cause={ctypes_.get(cause & 0xf, cause & 0xf)} containment={(cause >> 4) & 0xf} impl_cause={cause >> 32:#x} pc={pc:#x} data={sdata:#x}", flush=True)
+      elif ptype == 1 and len(q) >= 7:
+        names = ["xstatus", "xie", "xip", "xepc", "xtval", "xcause", "xscratch"]
+        print(f"  crashcat RISCV64 CSR state (mode {(hdr >> 40) & 7}): " + " ".join(f"{k}={v:#x}" for k, v in zip(names, q)), flush=True)
+      elif ptype == 2:
+        names = ["ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5",
+                 "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"]
+        print("  crashcat RISCV64 GPR state: " + " ".join(f"{k}={v:#x}" for k, v in zip(names, q)), flush=True)
+      elif ptype == 3: print("  crashcat RISCV64 PC trace: " + " ".join(f"{v:#x}" for v in q), flush=True)
+      elif ptype == 4: print("  crashcat IO32 state: " + " ".join(f"[{v & 0xffffffff:#x}]={v >> 32:#x}" for v in q), flush=True)
+      else: print(f"  crashcat packet type {ptype}: {payload.hex()}", flush=True)
+      off += 8 + plen
+    if n == 0: print("  crashcat: queue contains no packets", flush=True)
+
+  def coherency_probe(self, queue_view:MMIOInterface):
+    import platform, shutil, subprocess, os, ctypes
+    if platform.machine() != "x86_64" or not hasattr(self.logbuf_view, "mv") or not hasattr(queue_view, "mv"): return
+    if (cc:=shutil.which("cc")) is None: print("  coherency probe: no C compiler, skipped", flush=True); return
+    from tinygrad.helpers import cache_dir
+    src, lib = os.path.join(cache_dir, "clflush.c"), os.path.join(cache_dir, "clflush.dylib")
+    if not os.path.exists(lib):
+      with open(src, "w") as f: f.write("#include <immintrin.h>\n#include <stdint.h>\n#include <stddef.h>\nvoid flush_range(const void*p,size_t n){"
+        "const char*c=(const char*)((uintptr_t)p&~63ULL),*e=(const char*)p+n;_mm_mfence();for(;c<e;c+=64)_mm_clflush(c);_mm_mfence();}\n")
+      subprocess.run([cc, "-O2", "-shared", "-o", lib, src], check=True)
+    fl = ctypes.CDLL(lib).flush_range; fl.argtypes, fl.restype = [ctypes.c_void_p, ctypes.c_size_t], None
+    def addr_of(v:MMIOInterface) -> int: return ctypes.addressof(ctypes.c_char.from_buffer(v.mv))
+    before_q, before_l = bytes(queue_view[:0x1000]), bytes(self.logbuf_view[:])
+    fl(addr_of(queue_view), 0x1000); fl(addr_of(self.logbuf_view), len(before_l))
+    after_q, after_l = bytes(queue_view[:0x1000]), bytes(self.logbuf_view[:])
+    changed = [("stat queue page", before_q, after_q)] + [(f"LOG{n}", before_l[i*0x10000:(i+1)*0x10000], after_l[i*0x10000:(i+1)*0x10000])
+                                                          for i, n in enumerate(self.logbuf_names)]
+    for name, b, a in changed:
+      if b != a: print(f"  coherency probe: {name} CHANGED after clflush ({sum(1 for x in a if x)} nonzero bytes now, head {a[:32].hex()})", flush=True)
+    if all(b == a for _, b, a in changed): print("  coherency probe: nothing changed after clflush (no hidden GPU writes in DRAM)", flush=True)
 
   def init_gsp_image(self):
     _, sections, _ = elf_loader(fetch_fw("nvidia/ga102/gsp", "gsp-570.144.bin", "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f"))
@@ -451,6 +628,15 @@ class NV_GSP(NV_IP):
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
+    # NV_CRASHCAT_SYSMEM=1: hand GSP-RM a sysmem CrashCat report queue like OpenRM does (GspFwWprMeta.sysmemAddrOfCrashReportQueue), so a
+    # libos panic/exception report can be read from the host. Diagnostic only; off by default to keep the boot flow identical to upstream.
+    self.crashcat_view, self.crashcat_sysmem = None, 0
+    if getenv("NV_CRASHCAT_SYSMEM", 0):
+      cq_size = getenv("NV_CRASHCAT_SYSMEM_SIZE", 0x1000)
+      self.crashcat_view, _, cq_addrs = self.nvdev._alloc_boot_mem(cq_size, sysmem=True)
+      self.crashcat_view[:cq_size] = bytes(cq_size)
+      self.crashcat_sysmem, m.sysmemAddrOfCrashReportQueue, m.sizeOfCrashReportQueue = cq_addrs[0], cq_addrs[0], cq_size
+      if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: CrashCat sysmem queue at {cq_addrs[0]:#x} size {cq_size:#x}", flush=True)
     self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
     self.wpr_meta_sysmem = wpr_meta_addrs[0]
 

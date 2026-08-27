@@ -83,10 +83,29 @@ class NVDev:
     self.is_booting = False
 
     for ip in [self.flcn, self.gsp]: ip.init_sw()
+    if getenv("NV_FLUSH_BOOT", 0): self._flush_boot_sysmem()
     for ip in [self.flcn, self.gsp]: ip.init_hw()
 
   def fini(self):
     for ip in [self.gsp, self.flcn]: ip.fini_hw()
+
+  def _flush_boot_sysmem(self):
+    # NV_FLUSH_BOOT=1 (x86 only): clflush every sysmem boot buffer (libos args, RM args, WPR meta, radix3 image, queues, logs) before the
+    # GPU is started, so a device that reads host memory without snooping the CPU caches still sees the data. OpenRM maps the libos
+    # init-args page NV_MEMORY_UNCACHED for the same reason. Harmless when DMA is coherent.
+    import platform, shutil, subprocess, os, ctypes
+    views = [v for v in getattr(self, "boot_sysmem_views", []) if hasattr(v, "mv")]
+    if platform.machine() != "x86_64" or not views or (cc:=shutil.which("cc")) is None: return
+    from tinygrad.helpers import cache_dir
+    src, lib = os.path.join(cache_dir, "clflush.c"), os.path.join(cache_dir, "clflush.dylib")
+    if not os.path.exists(lib):
+      with open(src, "w") as f: f.write("#include <immintrin.h>\n#include <stdint.h>\n#include <stddef.h>\nvoid flush_range(const void*p,size_t n){"
+        "const char*c=(const char*)((uintptr_t)p&~63ULL),*e=(const char*)p+n;_mm_mfence();for(;c<e;c+=64)_mm_clflush(c);_mm_mfence();}\n")
+      subprocess.run([cc, "-O2", "-shared", "-o", lib, src], check=True)
+    fl = ctypes.CDLL(lib).flush_range; fl.argtypes, fl.restype = [ctypes.c_void_p, ctypes.c_size_t], None
+    total = 0
+    for v in views: fl(ctypes.addressof(ctypes.c_char.from_buffer(v.mv)), v.nbytes); total += v.nbytes
+    if DEBUG >= 2: print(f"nv {self.devfmt}: flushed {total:#x} bytes of boot sysmem from CPU caches", flush=True)
 
   def reg(self, reg:str) -> NVReg: return self.__dict__[reg]
   def wreg(self, addr:int, value:int):
@@ -151,6 +170,7 @@ class NVDev:
     if sysmem is True or (sysmem is None and not self.large_bar):
       view, sysaddr = self.pci_dev.alloc_sysmem(size, 0, contiguous=contiguous)
       paddr = None
+      self.boot_sysmem_views = getattr(self, "boot_sysmem_views", []) + [view]
     else:
       paddr = self.mm.palloc(sz, boot=False)
       view = self.vram.view(paddr, sz)
