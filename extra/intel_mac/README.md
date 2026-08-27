@@ -26,7 +26,7 @@ Ada cards should behave the same, Blackwell is untested. Everything here is MIT 
 ## Install
 
 ```sh
-git clone <this repo> ~/tinygrad-intel-mac && cd ~/tinygrad-intel-mac && git checkout intel-mac
+git clone https://github.com/paulscalise1/tinygrad.git ~/tinygrad-intel-mac && cd ~/tinygrad-intel-mac   # default branch is intel-mac
 python3.12 -m venv .venv && .venv/bin/pip install -e .
 colima start --cpu 8 --memory 8
 docker build --platform=linux/amd64 -t cuda-amd64:v2.3 -f extra/intel_mac/Dockerfile.cuda-amd64 extra/intel_mac
