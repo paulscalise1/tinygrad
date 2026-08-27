@@ -6,7 +6,7 @@ from tinygrad.device import Compiler, CompileError
 
 CUDA_PATH = getenv("CUDA_PATH", "")
 root = pathlib.Path(__file__).parents[3]
-osx_docker_cmd = f"docker run --rm -i -v {root}:{root} -e PYTHONPATH={root} ghcr.io/tinygrad/cuda-arm64:v2.3"
+osx_docker_cmd = f"docker run --rm -i -v {root}:{root} -e PYTHONPATH={root} {getenv('CUDA_DOCKER_IMAGE', 'ghcr.io/tinygrad/cuda-arm64:v2.3')}"
 
 def _get_bytes(arg, get_str, get_sz, check) -> bytes:
   x = ctypes.create_string_buffer(init_c_var(ctypes.c_size_t, lambda x: check(get_sz(arg, ctypes.byref(x)))).value)
@@ -53,7 +53,12 @@ class NVRTCCompiler(Compiler):
       if (nvrtcMajor.value, nvrtcMinor.value) >= (12, 4): self.compile_options.append("--minimal")
     super().__init__(f"compile_{cache_key}_{self.arch}")
   def compile(self, src:str) -> bytes:
-    if OSX: return self.compile_server(src, self.compiler_process)
+    if OSX:
+      # a failed or interrupted exchange (e.g. BEAM's SIGALRM timeout mid-read) leaves the pipe out of sync, restart the server
+      try: return self.compile_server(src, self.compiler_process)
+      except BaseException:
+        self.compiler_process.kill(); self.compiler_process = self.server(osx_docker_cmd, self.arch, self.ptx)
+        raise
     nvrtc_check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog := nvrtc.nvrtcProgram()), src.encode(), "<null>".encode(), 0, None, None))
     nvrtc_check(nvrtc.nvrtcCompileProgram(prog, len(self.compile_options), to_char_p_p([o.encode() for o in self.compile_options])), prog)
     data = _get_bytes(prog, nvrtc.nvrtcGetPTX if self.ptx else nvrtc.nvrtcGetCUBIN,
@@ -89,7 +94,12 @@ class NVPTXCompiler(PTXCompiler):
     else: jitlink_check(jitlink.nvJitLinkVersion(ctypes.byref(ctypes.c_uint()), ctypes.byref(ctypes.c_uint())))
     super().__init__(arch, cache_key="nv_ptx")
   def compile(self, src:str) -> bytes:
-    if OSX: return self.compile_server(src, self.compiler_process)
+    if OSX:
+      # a failed or interrupted exchange (e.g. BEAM's SIGALRM timeout mid-read) leaves the pipe out of sync, restart the server
+      try: return self.compile_server(src, self.compiler_process)
+      except BaseException:
+        self.compiler_process.kill(); self.compiler_process = self.server(osx_docker_cmd, self.arch, self.ptx)
+        raise
     jitlink_check(jitlink.nvJitLinkCreate(handle := jitlink.nvJitLinkHandle(), 1, to_char_p_p([f'-arch={self.arch}'.encode()])), handle)
     jitlink_check(jitlink.nvJitLinkAddData(handle, jitlink.NVJITLINK_INPUT_PTX, ptxsrc:=super().compile(src), len(ptxsrc), "<null>".encode()), handle)
     jitlink_check(jitlink.nvJitLinkComplete(handle), handle)

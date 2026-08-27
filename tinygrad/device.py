@@ -316,7 +316,11 @@ class Compiler:
     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
     unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    def readn(n:int) -> bytes:  # the pipe is unbuffered, a single read can return less than n bytes (32KB pipe buffer), read until complete
+      buf = b''
+      while len(buf) < n and (chunk:=unwrap(proc.stdout).read(n - len(buf))): buf += chunk
+      return buf
+    if (lib:=readn(struct.unpack("I", readn(4))[0])): return lib
     raise CompileError("Compilation Error")
 
 
