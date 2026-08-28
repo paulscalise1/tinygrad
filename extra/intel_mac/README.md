@@ -15,6 +15,9 @@ Ada cards should behave the same, Blackwell is untested. Everything here is MIT 
    read the length from the view and faulted.
 5. `cuda: compile server reads full replies`: kernel binaries over 32 KB were truncated by a short pipe read (BEAM hits it).
 6. `nv: GSP boot diagnostics`: env gated, default behaviour unchanged.
+7. `cuda: one docker compile server per process`: renderers are rebuilt on every unpickle, and the macOS compile server was
+   started in the compiler constructor, so BEAM started a docker container per candidate (hundreds at once, which took down the
+   colima docker socket). The server is now started lazily and shared per process: at most `PARALLEL` + 1 containers.
 
 ## Requirements
 
